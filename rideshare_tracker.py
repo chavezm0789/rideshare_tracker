@@ -18,63 +18,44 @@ if "active_shift" not in st.session_state:
 
 
 # ------------------------------------------------------------
-# DB: Connection + Setup
+# DB CONNECTION
 # ------------------------------------------------------------
-def _require_secrets():
-    """
-    Expect secrets in Streamlit format:
-
-    [db]
-    host = "..."
-    port = 5432
-    dbname = "postgres"
-    user = "postgres"
-    password = "..."
-    sslmode = "require"
-
-    OR
-
-    [db]
-    dsn = "postgresql://user:pass@host:5432/dbname?sslmode=require"
-    """
-    if "db" not in st.secrets:
-        st.error("Missing [db] secrets. Add them in Streamlit Cloud → App settings → Secrets.")
-        st.stop()
+def _stop_missing_secrets():
+    st.error("No DB secrets found. Add them in Streamlit Cloud → Settings → Secrets.")
+    st.stop()
 
 
 @st.cache_resource
 def get_conn():
-    _require_secrets()
+    # Expect secrets like:
+    # [db]
+    # dsn = "postgresql://...."
+    if "db" not in st.secrets or "dsn" not in st.secrets["db"]:
+        _stop_missing_secrets()
 
-    db = st.secrets["db"]
+    dsn = st.secrets["db"]["dsn"]
 
-    if "dsn" in db and db["dsn"]:
-        conn = psycopg2.connect(db["dsn"], cursor_factory=RealDictCursor)
-    else:
-        conn = psycopg2.connect(
-            host=db["host"],
-            port=int(db.get("port", 5432)),
-            dbname=db.get("dbname", "postgres"),
-            user=db["user"],
-            password=db["password"],
-            sslmode=db.get("sslmode", "require"),
-            cursor_factory=RealDictCursor,
-        )
+    # Force SSL if missing
+    if "sslmode=" not in dsn:
+        if "?" in dsn:
+            dsn += "&sslmode=require"
+        else:
+            dsn += "?sslmode=require"
 
-    conn.autocommit = True
-    return conn
+    try:
+        conn = psycopg2.connect(dsn, cursor_factory=RealDictCursor)
+        conn.autocommit = True
+        return conn
+    except Exception as e:
+        st.error(f"Database connection failed: {e}")
+        st.stop()
 
 
 def init_db():
-    """
-    Creates tables if they don't exist.
-    We use pgcrypto's gen_random_uuid() for UUIDs.
-    """
     conn = get_conn()
     with conn.cursor() as cur:
-        cur.execute("""
-        create extension if not exists pgcrypto;
-        """)
+        # Needed for gen_random_uuid()
+        cur.execute("create extension if not exists pgcrypto;")
 
         cur.execute("""
         create table if not exists public.shifts (
@@ -123,17 +104,16 @@ def init_db():
         """)
 
 
+# Init DB safely (don’t hide the real error)
+try:
+    init_db()
+except Exception as e:
+    st.error(f"Database init failed: {e}")
+    st.stop()
+
+
 def weighted_rate(numerator: float, denominator: float) -> float:
     return (numerator / denominator) if denominator and denominator > 0 else 0.0
-
-
-def qdf_to_float(x, default=0.0) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
 
 
 def load_shifts() -> pd.DataFrame:
@@ -202,17 +182,13 @@ def insert_expense(row: dict) -> None:
         )
 
 
-# Run DB setup once
-init_db()
-
 # ------------------------------------------------------------
 # UI TABS
 # ------------------------------------------------------------
 tabs = st.tabs(["🚗 Log Shift", "💸 Log Expense", "📊 Dashboard"])
 
-
 # ============================================================
-# TAB 1: LOG SHIFT (Start -> start odo later -> End -> end odo + earnings)
+# TAB 1: SHIFT LOGGING
 # ============================================================
 with tabs[0]:
     st.subheader("Log a Driving Shift")
@@ -249,7 +225,6 @@ with tabs[0]:
 
         if status == "awaiting_start_odo":
             st.markdown("### Enter Start Odometer (when safe)")
-
             st.info(
                 f"Shift date: **{active['shift_date']}** · Platform: **{active['platform']}** · "
                 f"Started: **{start_ts.strftime('%H:%M')}**"
@@ -369,7 +344,7 @@ with tabs[0]:
 
 
 # ============================================================
-# TAB 2: LOG EXPENSE
+# TAB 2: EXPENSES
 # ============================================================
 with tabs[1]:
     st.subheader("Log an Expense")
@@ -380,7 +355,7 @@ with tabs[1]:
         category = st.selectbox(
             "Category",
             ["Gas", "Maintenance", "Car Wash", "Parking/Tolls", "Insurance", "Phone", "Supplies", "Other"],
-            key="t2_cat"
+            key="t2_cat",
         )
         description = st.text_input("Description", key="t2_desc")
     with c2:
@@ -399,7 +374,7 @@ with tabs[1]:
             "amount": amount,
             "business_use_pct": int(business_pct),
             "deductible_amount": deductible,
-            "notes": notes
+            "notes": notes,
         }
         insert_expense(row)
         st.success("Expense saved.")
@@ -440,26 +415,24 @@ with tabs[2]:
     else:
         expenses_df = pd.DataFrame(columns=["exp_date", "deductible_amount"])
 
+    # ---- SAFE DATE DEFAULTS (this fixes your crash) ----
+    valid_dates = shifts_df["shift_date"].dropna()
+    if len(valid_dates) == 0:
+        default_from = date.today()
+        default_to = date.today()
+    else:
+        default_from = valid_dates.min().date()
+        default_to = valid_dates.max().date()
+
     # Filters
-    from datetime import date
-
-c1, c2 = st.columns(2)
-
-# Safe date defaults (handles empty / NaT)
-valid_dates = shifts_df["shift_date"].dropna()
-
-if len(valid_dates) == 0:
-    default_from = date.today()
-    default_to = date.today()
-else:
-    default_from = valid_dates.min().date()
-    default_to = valid_dates.max().date()
-
-with c1:
-    start_date = st.date_input("From", value=default_from, key="t3_from")
-
-with c2:
-    end_date = st.date_input("To", value=default_to, key="t3_to")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        start_date = st.date_input("From", value=default_from, key="t3_from")
+    with c2:
+        end_date = st.date_input("To", value=default_to, key="t3_to")
+    with c3:
+        platforms = sorted([p for p in shifts_df["platform"].dropna().unique().tolist()])
+        platform_filter = st.multiselect("Platform", platforms, default=platforms, key="t3_platform")
 
     mask = (
         (shifts_df["shift_date"] >= pd.to_datetime(start_date)) &
@@ -544,5 +517,4 @@ with c2:
         st.dataframe(monthly, use_container_width=True, height=300)
     with cy:
         st.markdown("#### Yearly")
-
         st.dataframe(yearly, use_container_width=True, height=300)
