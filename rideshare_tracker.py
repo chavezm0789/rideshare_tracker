@@ -441,14 +441,25 @@ with tabs[2]:
         expenses_df = pd.DataFrame(columns=["exp_date", "deductible_amount"])
 
     # Filters
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        start_date = st.date_input("From", value=shifts_df["shift_date"].min().date(), key="t3_from")
-    with c2:
-        end_date = st.date_input("To", value=shifts_df["shift_date"].max().date(), key="t3_to")
-    with c3:
-        platforms = sorted([p for p in shifts_df["platform"].dropna().unique().tolist()])
-        platform_filter = st.multiselect("Platform", platforms, default=platforms, key="t3_platform")
+    from datetime import date
+
+c1, c2 = st.columns(2)
+
+# Safe date defaults (handles empty / NaT)
+valid_dates = shifts_df["shift_date"].dropna()
+
+if len(valid_dates) == 0:
+    default_from = date.today()
+    default_to = date.today()
+else:
+    default_from = valid_dates.min().date()
+    default_to = valid_dates.max().date()
+
+with c1:
+    start_date = st.date_input("From", value=default_from, key="t3_from")
+
+with c2:
+    end_date = st.date_input("To", value=default_to, key="t3_to")
 
     mask = (
         (shifts_df["shift_date"] >= pd.to_datetime(start_date)) &
@@ -533,4 +544,5 @@ with tabs[2]:
         st.dataframe(monthly, use_container_width=True, height=300)
     with cy:
         st.markdown("#### Yearly")
+
         st.dataframe(yearly, use_container_width=True, height=300)
