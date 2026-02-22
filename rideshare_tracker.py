@@ -5,9 +5,9 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime, date
 
 # ------------------------------------------------------------
-# VERSION STAMP (so we can SEE deployments)
+# VERSION STAMP
 # ------------------------------------------------------------
-APP_VERSION = "v2026-02-21_true-cost_01"
+APP_VERSION = "v2026-02-22_true-cost_prod_01"
 
 # ------------------------------------------------------------
 # STREAMLIT CONFIG
@@ -120,7 +120,7 @@ def load_shifts() -> pd.DataFrame:
         from public.shifts
         where shift_date is not null
           and platform is not null
-          and platform <> 'platform'
+          and trim(lower(platform)) <> 'platform'
         order by shift_date desc, created_at desc;
     """
     return pd.read_sql_query(query, conn)
@@ -173,14 +173,9 @@ def insert_expense(row: dict) -> None:
             row,
         )
 
-# ------------------------------------------------------------
-# UI TABS
-# ------------------------------------------------------------
 tabs = st.tabs(["🚗 Log Shift", "💸 Log Expense", "📊 Dashboard"])
 
-# ============================================================
-# TAB 1: SHIFT LOGGING
-# ============================================================
+# ---------------- TAB 1: LOG SHIFT ----------------
 with tabs[0]:
     st.subheader("Log a Driving Shift")
 
@@ -209,7 +204,6 @@ with tabs[0]:
             }
             st.success("Shift started.")
             st.rerun()
-
     else:
         status = active.get("status", "running")
         start_ts: datetime = active["start_ts"]
@@ -331,11 +325,12 @@ with tabs[0]:
     else:
         show = shifts_df.copy()
         show["shift_date"] = pd.to_datetime(show["shift_date"], errors="coerce").dt.date
-        st.dataframe(show.head(20), use_container_width=True)
+        # show useful columns first
+        cols = ["shift_date", "platform", "online_hours", "total_income", "miles", "hourly_rate", "rides", "shift_label", "notes"]
+        cols = [c for c in cols if c in show.columns]
+        st.dataframe(show[cols].head(25), use_container_width=True)
 
-# ============================================================
-# TAB 2: EXPENSES
-# ============================================================
+# ---------------- TAB 2: LOG EXPENSE ----------------
 with tabs[1]:
     st.subheader("Log an Expense")
 
@@ -378,13 +373,143 @@ with tabs[1]:
     else:
         show = expenses_df.copy()
         show["exp_date"] = pd.to_datetime(show["exp_date"], errors="coerce").dt.date
-        st.dataframe(show.head(20), use_container_width=True)
+        cols = ["exp_date", "category", "amount", "business_use_pct", "deductible_amount", "description", "notes"]
+        cols = [c for c in cols if c in show.columns]
+        st.dataframe(show[cols].head(25), use_container_width=True)
 
-# ============================================================
-# TAB 3: DASHBOARD (minimal, just to prove deploy)
-# ------------------------------------------------------------
+# ---------------- TAB 3: DASHBOARD ----------------
 with tabs[2]:
     st.subheader("Dashboard")
-    st.info("If you can see the version stamp at the top, Streamlit is running the latest code.")
-    st.write("Now we’ll re-add True Cost once deploy is confirmed.")
 
+    shifts_df = load_shifts()
+    expenses_df = load_expenses()
+
+    if len(shifts_df) == 0:
+        st.info("Log at least one shift to see stats.")
+        st.stop()
+
+    shifts_df["shift_date"] = pd.to_datetime(shifts_df["shift_date"], errors="coerce")
+    for col in ["total_income", "online_hours", "miles", "rides", "hourly_rate"]:
+        shifts_df[col] = pd.to_numeric(shifts_df[col], errors="coerce").fillna(0)
+
+    if len(expenses_df) > 0:
+        expenses_df["exp_date"] = pd.to_datetime(expenses_df["exp_date"], errors="coerce")
+        expenses_df["deductible_amount"] = pd.to_numeric(expenses_df["deductible_amount"], errors="coerce").fillna(0)
+    else:
+        expenses_df = pd.DataFrame(columns=["exp_date", "category", "deductible_amount"])
+        expenses_df["exp_date"] = pd.to_datetime(expenses_df["exp_date"], errors="coerce")
+
+    valid_dates = shifts_df["shift_date"].dropna()
+    default_from = valid_dates.min().date() if len(valid_dates) else date.today()
+    default_to = valid_dates.max().date() if len(valid_dates) else date.today()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        start_date = st.date_input("From", value=default_from, key="t3_from")
+    with c2:
+        end_date = st.date_input("To", value=default_to, key="t3_to")
+    with c3:
+        platforms = sorted([p for p in shifts_df["platform"].dropna().unique().tolist()])
+        platform_filter = st.multiselect("Platform", platforms, default=platforms, key="t3_platform")
+
+    mask = (
+        (shifts_df["shift_date"] >= pd.to_datetime(start_date)) &
+        (shifts_df["shift_date"] <= pd.to_datetime(end_date)) &
+        (shifts_df["platform"].isin(platform_filter))
+    )
+    s = shifts_df[mask].copy()
+
+    if len(s) == 0:
+        st.warning("No shifts match your filters.")
+        st.stop()
+
+    total_income = float(s["total_income"].sum())
+    total_hours = float(s["online_hours"].sum())
+    total_miles = float(s["miles"].sum())
+    total_rides = float(s["rides"].sum())
+
+    emask = (
+        (expenses_df["exp_date"] >= pd.to_datetime(start_date)) &
+        (expenses_df["exp_date"] <= pd.to_datetime(end_date))
+    )
+    e = expenses_df[emask].copy() if len(expenses_df) else pd.DataFrame(columns=["category", "deductible_amount"])
+
+    total_expenses_logged = float(e["deductible_amount"].sum()) if len(e) else 0.0
+    net_logged = total_income - total_expenses_logged
+
+    gross_per_hour = weighted_rate(total_income, total_hours)
+    net_per_hour_logged = weighted_rate(net_logged, total_hours)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Gross income", f"${total_income:,.2f}")
+    m2.metric("Expenses (logged)", f"${total_expenses_logged:,.2f}")
+    m3.metric("Net (logged)", f"${net_logged:,.2f}")
+    m4.metric("Rides", f"{int(total_rides)}")
+
+    m5, m6, m7 = st.columns(3)
+    m5.metric("Gross per hour", f"${gross_per_hour:,.2f}")
+    m6.metric("Net per hour (logged)", f"${net_per_hour_logged:,.2f}")
+    m7.metric("Miles", f"{total_miles:,.1f}")
+
+    st.markdown("---")
+    st.subheader("True Cost (includes wear & tear)")
+
+    EXTRA_CATS = {"Parking/Tolls", "Phone", "Supplies", "Other"}
+
+    method = st.selectbox("True cost method", ["IRS mileage rate", "Custom per-mile model"], key="tc_method")
+
+    if method == "IRS mileage rate":
+        st.caption("Vehicle cost is estimated as miles × rate (bundles fuel + maintenance + depreciation).")
+        rate = st.number_input("Mileage rate ($/mile)", min_value=0.0, step=0.01, value=0.67, key="tc_rate")
+
+        vehicle_cost = total_miles * float(rate)
+        extra_expenses = float(e[e["category"].isin(list(EXTRA_CATS))]["deductible_amount"].sum()) if len(e) else 0.0
+
+        true_cost_total = vehicle_cost + extra_expenses
+        true_net = total_income - true_cost_total
+        true_per_hour = weighted_rate(true_net, total_hours)
+
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Estimated vehicle cost", f"${vehicle_cost:,.2f}")
+        t2.metric("Extra expenses (add-on)", f"${extra_expenses:,.2f}")
+        t3.metric("True cost net", f"${true_net:,.2f}")
+        t4.metric("True cost per hour", f"${true_per_hour:,.2f}")
+
+    else:
+        st.caption("Custom model estimates depreciation + fuel + maintenance as a per-mile cost.")
+
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            purchase_price = st.number_input("Car purchase price ($)", 0.0, step=100.0, value=20000.0, key="tc_buy")
+            resale_value = st.number_input("Estimated resale value ($)", 0.0, step=100.0, value=8000.0, key="tc_resale")
+            lifetime_miles = st.number_input("Expected lifetime miles", 1.0, step=1000.0, value=200000.0, key="tc_life")
+        with a2:
+            mpg = st.number_input("MPG (average)", 1.0, step=0.5, value=25.0, key="tc_mpg")
+            gas_price = st.number_input("Gas price ($/gal)", 0.0, step=0.05, value=3.50, key="tc_gas")
+            maint_per_mile = st.number_input("Maintenance ($/mile)", 0.0, step=0.01, value=0.10, key="tc_maint")
+        with a3:
+            tires_per_mile = st.number_input("Tires ($/mile)", 0.0, step=0.01, value=0.02, key="tc_tires")
+            misc_per_mile = st.number_input("Other ($/mile)", 0.0, step=0.01, value=0.03, key="tc_misc")
+            include_extras = st.checkbox("Subtract logged extras too", value=True, key="tc_extras")
+
+        depreciation_per_mile = max(purchase_price - resale_value, 0.0) / float(lifetime_miles)
+        fuel_per_mile = (gas_price / mpg) if mpg else 0.0
+        per_mile = float(depreciation_per_mile + fuel_per_mile + maint_per_mile + tires_per_mile + misc_per_mile)
+
+        vehicle_cost = total_miles * per_mile
+        extra_expenses = float(e[e["category"].isin(list(EXTRA_CATS))]["deductible_amount"].sum()) if (include_extras and len(e)) else 0.0
+
+        true_cost_total = vehicle_cost + extra_expenses
+        true_net = total_income - true_cost_total
+        true_per_hour = weighted_rate(true_net, total_hours)
+
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Depreciation ($/mile)", f"${depreciation_per_mile:,.3f}")
+        b2.metric("Fuel ($/mile)", f"${fuel_per_mile:,.3f}")
+        b3.metric("Total ($/mile)", f"${per_mile:,.3f}")
+        b4.metric("Vehicle cost (period)", f"${vehicle_cost:,.2f}")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Extra expenses", f"${extra_expenses:,.2f}")
+        c2.metric("True cost net", f"${true_net:,.2f}")
+        c3.metric("True cost per hour", f"${true_per_hour:,.2f}")
