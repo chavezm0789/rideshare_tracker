@@ -104,7 +104,7 @@ def init_db():
         """)
 
 
-# Init DB safely (don’t hide the real error)
+# Init DB safely
 try:
     init_db()
 except Exception as e:
@@ -118,6 +118,9 @@ def weighted_rate(numerator: float, denominator: float) -> float:
 
 def load_shifts() -> pd.DataFrame:
     conn = get_conn()
+    # Filter out junk rows at the source:
+    # - shift_date must exist
+    # - platform can't be the literal header string "platform"
     query = """
         select
             id, created_at,
@@ -126,6 +129,9 @@ def load_shifts() -> pd.DataFrame:
             gross_fares, in_app_tips, bonuses, cash_tips, total_income,
             miles, rides, notes, hourly_rate
         from public.shifts
+        where shift_date is not null
+          and platform is not null
+          and platform <> 'platform'
         order by shift_date desc, created_at desc;
     """
     return pd.read_sql_query(query, conn)
@@ -299,7 +305,7 @@ with tabs[0]:
 
             st.write(f"**Miles (calculated):** {miles:.1f}")
             st.write(f"**Total income:** ${total_income:.2f}")
-            st.write(f"**Hourly rate (this shift):** ${hourly_rate:.2f}/hr")
+            st.write(f"**Hourly rate (gross):** ${hourly_rate:.2f}/hr")
 
             b1, b2 = st.columns(2)
             with b1:
@@ -325,7 +331,7 @@ with tabs[0]:
                     }
                     insert_shift(row)
                     st.session_state["active_shift"] = None
-                    st.success(f"Shift saved. Hourly: ${hourly_rate:.2f}/hr")
+                    st.success(f"Shift saved. Gross hourly: ${hourly_rate:.2f}/hr")
                     st.rerun()
             with b2:
                 if st.button("Cancel (don’t save)", key="t1_cancel_3"):
@@ -413,9 +419,10 @@ with tabs[2]:
         expenses_df["exp_date"] = pd.to_datetime(expenses_df["exp_date"], errors="coerce")
         expenses_df["deductible_amount"] = pd.to_numeric(expenses_df["deductible_amount"], errors="coerce").fillna(0)
     else:
-        expenses_df = pd.DataFrame(columns=["exp_date", "deductible_amount"])
+        expenses_df = pd.DataFrame(columns=["exp_date", "category", "deductible_amount"])
+        expenses_df["exp_date"] = pd.to_datetime(expenses_df["exp_date"], errors="coerce")
 
-    # ---- SAFE DATE DEFAULTS (this fixes your crash) ----
+    # SAFE DATE DEFAULTS
     valid_dates = shifts_df["shift_date"].dropna()
     if len(valid_dates) == 0:
         default_from = date.today()
@@ -450,28 +457,122 @@ with tabs[2]:
     total_miles = float(s["miles"].sum())
     total_rides = float(s["rides"].sum())
 
-    # Expenses filtered by date range (expenses aren't tied to platform)
+    # Expenses filtered by date range
     emask = (
         (expenses_df["exp_date"] >= pd.to_datetime(start_date)) &
         (expenses_df["exp_date"] <= pd.to_datetime(end_date))
     )
-    total_expenses = float(expenses_df[emask]["deductible_amount"].sum()) if len(expenses_df) else 0.0
+    e = expenses_df[emask].copy() if len(expenses_df) else pd.DataFrame(columns=["category", "deductible_amount"])
 
-    net = total_income - total_expenses
+    total_expenses_all = float(e["deductible_amount"].sum()) if len(e) else 0.0
+    net_all = total_income - total_expenses_all
     gross_per_hour = weighted_rate(total_income, total_hours)
-    net_per_hour = weighted_rate(net, total_hours)
-    net_per_mile = weighted_rate(net, total_miles)
+    net_per_hour_all = weighted_rate(net_all, total_hours)
+    net_per_mile_all = weighted_rate(net_all, total_miles)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Gross income", f"${total_income:,.2f}")
-    m2.metric("Expenses (deductible)", f"${total_expenses:,.2f}")
-    m3.metric("Net", f"${net:,.2f}")
+    m2.metric("Expenses (logged)", f"${total_expenses_all:,.2f}")
+    m3.metric("Net (logged expenses)", f"${net_all:,.2f}")
     m4.metric("Rides", f"{int(total_rides)}")
 
     m5, m6, m7 = st.columns(3)
     m5.metric("Gross per hour", f"${gross_per_hour:,.2f}")
-    m6.metric("Net per hour", f"${net_per_hour:,.2f}")
-    m7.metric("Net per mile", f"${net_per_mile:,.2f}")
+    m6.metric("Net per hour (logged)", f"${net_per_hour_all:,.2f}")
+    m7.metric("Net per mile (logged)", f"${net_per_mile_all:,.2f}")
+
+    st.markdown("---")
+    st.subheader("True Cost (includes wear & tear)")
+
+    # When using IRS-style mileage, avoid double counting vehicle operating costs.
+    # Typical "extra" categories that are safe to subtract in addition:
+    # - Parking/Tolls (often allowed in addition)
+    # - Phone (business portion)
+    # - Supplies
+    # - Other (business)
+    EXTRA_CATS = {"Parking/Tolls", "Phone", "Supplies", "Other"}
+
+    tc1, tc2 = st.columns([1, 2])
+
+    with tc1:
+        true_cost_method = st.selectbox(
+            "True cost method",
+            ["IRS mileage rate", "Custom per-mile model"],
+            key="tc_method"
+        )
+
+    if true_cost_method == "IRS mileage rate":
+        with tc2:
+            st.caption("This estimates vehicle cost as: miles × rate. (Rate already bundles fuel + maintenance + depreciation.)")
+            irs_rate = st.number_input(
+                "Mileage rate ($/mile)",
+                min_value=0.0,
+                step=0.01,
+                value=0.67,  # editable default; change anytime
+                key="tc_irs_rate"
+            )
+
+        vehicle_cost = float(total_miles) * float(irs_rate)
+
+        extra_expenses = 0.0
+        if len(e):
+            extra_expenses = float(e[e["category"].isin(list(EXTRA_CATS))]["deductible_amount"].sum())
+
+        true_cost_total = vehicle_cost + extra_expenses
+
+        true_net = total_income - true_cost_total
+        true_per_hour = weighted_rate(true_net, total_hours)
+        true_per_mile = weighted_rate(true_net, total_miles)
+
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Estimated vehicle cost", f"${vehicle_cost:,.2f}")
+        t2.metric("Extra expenses (add-on)", f"${extra_expenses:,.2f}")
+        t3.metric("True cost net", f"${true_net:,.2f}")
+        t4.metric("True cost per hour", f"${true_per_hour:,.2f}")
+
+        st.caption(f"True cost per mile: ${true_per_mile:,.2f}")
+
+    else:
+        st.caption("Custom model estimates depreciation + fuel + maintenance as a per-mile cost you control.")
+
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            purchase_price = st.number_input("Car purchase price ($)", min_value=0.0, step=100.0, value=20000.0, key="tc_buy")
+            resale_value = st.number_input("Estimated resale value ($)", min_value=0.0, step=100.0, value=8000.0, key="tc_resale")
+            lifetime_miles = st.number_input("Expected lifetime miles", min_value=1.0, step=1000.0, value=200000.0, key="tc_life")
+        with cc2:
+            mpg = st.number_input("MPG (average)", min_value=1.0, step=0.5, value=25.0, key="tc_mpg")
+            gas_price = st.number_input("Gas price ($/gal)", min_value=0.0, step=0.05, value=3.50, key="tc_gas")
+            maint_per_mile = st.number_input("Maintenance ($/mile)", min_value=0.0, step=0.01, value=0.10, key="tc_maint")
+        with cc3:
+            tires_per_mile = st.number_input("Tires ($/mile)", min_value=0.0, step=0.01, value=0.02, key="tc_tires")
+            misc_per_mile = st.number_input("Other ($/mile)", min_value=0.0, step=0.01, value=0.03, key="tc_misc")
+            include_logged_extras = st.checkbox("Subtract logged extra expenses too", value=True, key="tc_include_extras")
+
+        depreciation_per_mile = max((purchase_price - resale_value), 0.0) / float(lifetime_miles)
+        fuel_per_mile = (gas_price / mpg) if mpg > 0 else 0.0
+
+        custom_rate = float(depreciation_per_mile + fuel_per_mile + maint_per_mile + tires_per_mile + misc_per_mile)
+        vehicle_cost = float(total_miles) * custom_rate
+
+        extra_expenses = 0.0
+        if include_logged_extras and len(e):
+            extra_expenses = float(e[e["category"].isin(list(EXTRA_CATS))]["deductible_amount"].sum())
+
+        true_cost_total = vehicle_cost + extra_expenses
+        true_net = total_income - true_cost_total
+        true_per_hour = weighted_rate(true_net, total_hours)
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Depreciation ($/mile)", f"${depreciation_per_mile:,.3f}")
+        r2.metric("Fuel ($/mile)", f"${fuel_per_mile:,.3f}")
+        r3.metric("Custom total ($/mile)", f"${custom_rate:,.3f}")
+        r4.metric("Vehicle cost (period)", f"${vehicle_cost:,.2f}")
+
+        rr1, rr2, rr3 = st.columns(3)
+        rr1.metric("Extra expenses (add-on)", f"${extra_expenses:,.2f}")
+        rr2.metric("True cost net", f"${true_net:,.2f}")
+        rr3.metric("True cost per hour", f"${true_per_hour:,.2f}")
 
     st.markdown("---")
     st.subheader("Income over time")
@@ -493,15 +594,17 @@ with tabs[2]:
         out = (
             df.groupby(group_col, as_index=False)
               .agg(total_income=("total_income", "sum"),
-                   total_hours=("online_hours", "sum"))
+                   total_hours=("online_hours", "sum"),
+                   total_miles=("miles", "sum"))
         )
-        out["hourly_rate"] = out.apply(
+        out["gross_per_hour"] = out.apply(
             lambda r: weighted_rate(float(r["total_income"]), float(r["total_hours"])),
             axis=1
         )
         out["total_income"] = out["total_income"].round(2)
         out["total_hours"] = out["total_hours"].round(2)
-        out["hourly_rate"] = out["hourly_rate"].round(2)
+        out["total_miles"] = out["total_miles"].round(1)
+        out["gross_per_hour"] = out["gross_per_hour"].round(2)
         return out
 
     weekly = build_summary(s, "week").sort_values("week", ascending=False)
